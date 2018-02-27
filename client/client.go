@@ -1003,12 +1003,9 @@ func (c *Client) updateNodeFromFingerprint(response *cstructs.FingerprintRespons
 
 	for name, newVal := range response.Drivers {
 		oldVal := c.config.Node.Drivers[name]
-		if newVal.Equals(oldVal) {
-			continue
-		}
-		if oldVal == nil {
+		if oldVal == nil && newVal != nil {
 			c.config.Node.Drivers[name] = newVal
-		} else {
+		} else if newVal != nil && newVal.Detected != oldVal.Detected {
 			c.config.Node.Drivers[name].MergeFingerprintInfo(newVal)
 		}
 	}
@@ -1027,8 +1024,11 @@ func (c *Client) updateNodeFromHealthCheck(response *cstructs.HealthCheckRespons
 
 	// update the node with the latest driver health information
 	for name, newVal := range response.Drivers {
+		if newVal == nil {
+			continue
+		}
 		oldVal := c.config.Node.Drivers[name]
-		if newVal.Equals(oldVal) {
+		if newVal.HealthCheckEquals(oldVal) {
 			continue
 		}
 		nodeHasChanged = true
@@ -1597,6 +1597,7 @@ func (c *Client) watchNodeUpdates() {
 			c.retryRegisterNode()
 
 			hasChanged = false
+			timer.Reset(c.retryIntv(nodeUpdateRetryIntv))
 		case <-c.triggerNodeUpdate:
 			if hasChanged {
 				continue
