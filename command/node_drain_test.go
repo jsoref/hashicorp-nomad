@@ -5,15 +5,180 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/nomad/api"
+	"github.com/hashicorp/nomad/command/agent"
+	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/mitchellh/cli"
 	"github.com/posener/complete"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNodeDrainCommand_Implements(t *testing.T) {
 	t.Parallel()
 	var _ cli.Command = &NodeDrainCommand{}
+}
+
+func TestNodeDrainCommand_Detach(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	server, client, url := testServer(t, true, func(c *agent.Config) {
+		c.NodeName = "drain_detach_node"
+	})
+	defer server.Shutdown()
+
+	// Wait for a node to appear
+	var nodeID string
+	testutil.WaitForResult(func() (bool, error) {
+		nodes, _, err := client.Nodes().List(nil)
+		if err != nil {
+			return false, err
+		}
+		if len(nodes) == 0 {
+			return false, fmt.Errorf("missing node")
+		}
+		nodeID = nodes[0].ID
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %s", err)
+	})
+
+	// Register a job to create an alloc to drain that will block draining
+	job := &api.Job{
+		ID:          helper.StringToPtr("mock_service"),
+		Name:        helper.StringToPtr("mock_service"),
+		Datacenters: []string{"dc1"},
+		TaskGroups: []*api.TaskGroup{
+			{
+				Name: helper.StringToPtr("mock_group"),
+				Tasks: []*api.Task{
+					{
+						Name:   "mock_task",
+						Driver: "mock_driver",
+						Config: map[string]interface{}{
+							"run_for":    "10m",
+							"exit_after": "10m",
+							"kill_after": "10m",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, _, err := client.Jobs().Register(job, nil)
+	require.Nil(err)
+
+	testutil.WaitForResult(func() (bool, error) {
+		allocs, _, err := client.Nodes().Allocations(nodeID, nil)
+		if err != nil {
+			return false, err
+		}
+		if len(allocs) == 0 {
+			return false, fmt.Errorf("no allocs")
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+
+	ui := new(cli.MockUi)
+	cmd := &NodeDrainCommand{Meta: Meta{Ui: ui}}
+	if code := cmd.Run([]string{"-address=" + url, "-self", "-enable", "-detach"}); code != 0 {
+		t.Fatalf("expected exit 0, got: %d", code)
+	}
+
+	out := ui.OutputWriter.String()
+	expected := "drain strategy set"
+	require.Contains(out, expected)
+
+	node, _, err := client.Nodes().Info(nodeID, nil)
+	require.Nil(err)
+	require.NotNil(node.DrainStrategy)
+}
+
+func TestNodeDrainCommand_Monitor(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	server, client, url := testServer(t, true, func(c *agent.Config) {
+		c.NodeName = "drain_monitor_node"
+	})
+	defer server.Shutdown()
+
+	// Wait for a node to appear
+	var nodeID string
+	testutil.WaitForResult(func() (bool, error) {
+		nodes, _, err := client.Nodes().List(nil)
+		if err != nil {
+			return false, err
+		}
+		if len(nodes) == 0 {
+			return false, fmt.Errorf("missing node")
+		}
+		nodeID = nodes[0].ID
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %s", err)
+	})
+
+	// Register a job to create an alloc to drain
+	job := &api.Job{
+		ID:          helper.StringToPtr("mock_service"),
+		Name:        helper.StringToPtr("mock_service"),
+		Datacenters: []string{"dc1"},
+		TaskGroups: []*api.TaskGroup{
+			{
+				Name: helper.StringToPtr("mock_group"),
+				Tasks: []*api.Task{
+					{
+						Name:   "mock_task",
+						Driver: "mock_driver",
+						Config: map[string]interface{}{
+							"run_for":    "10m",
+							"exit_after": "500ms",
+							"kill_after": "10m",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, _, err := client.Jobs().Register(job, nil)
+	require.Nil(err)
+
+	testutil.WaitForResult(func() (bool, error) {
+		allocs, _, err := client.Nodes().Allocations(nodeID, nil)
+		if err != nil {
+			return false, err
+		}
+		if len(allocs) == 0 {
+			return false, fmt.Errorf("no allocs")
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+
+	ui := new(cli.MockUi)
+	cmd := &NodeDrainCommand{Meta: Meta{Ui: ui}}
+	if code := cmd.Run([]string{"-address=" + url, "-self", "-enable", "-deadline", "1s"}); code != 0 {
+		t.Fatalf("expected exit 0, got: %d", code)
+	}
+
+	out := ui.OutputWriter.String()
+	expected := "drain complete"
+	require.Contains(out, expected)
+
+	node, _, err := client.Nodes().Info(nodeID, nil)
+	require.Nil(err)
+	require.Nil(node.DrainStrategy)
+
+	allocs, _, err := client.Nodes().Allocations(nodeID, nil)
+	require.Nil(err)
+	require.Len(allocs, 1)
+	require.Equal("stop", allocs[0].DesiredStatus)
 }
 
 func TestNodeDrainCommand_Fails(t *testing.T) {

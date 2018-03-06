@@ -45,6 +45,9 @@ Node Drain Options:
     Remaining allocations after the deadline are forced removed from the node.
     If unspecified, a default deadline of one hour is applied.
 
+  -detach
+    Return immediately instead of entering monitor mode.
+
   -force
     Force remove allocations off the node immediately.
 
@@ -75,6 +78,7 @@ func (c *NodeDrainCommand) AutocompleteFlags() complete.Flags {
 			"-disable":       complete.PredictNothing,
 			"-enable":        complete.PredictNothing,
 			"-deadline":      complete.PredictAnything,
+			"-detach":        complete.PredictNothing,
 			"-force":         complete.PredictNothing,
 			"-no-deadline":   complete.PredictNothing,
 			"-ignore-system": complete.PredictNothing,
@@ -99,7 +103,7 @@ func (c *NodeDrainCommand) AutocompleteArgs() complete.Predictor {
 }
 
 func (c *NodeDrainCommand) Run(args []string) int {
-	var enable, disable, force,
+	var enable, disable, detach, force,
 		noDeadline, ignoreSystem, self, autoYes bool
 	var deadline string
 
@@ -108,6 +112,7 @@ func (c *NodeDrainCommand) Run(args []string) int {
 	flags.BoolVar(&enable, "enable", false, "Enable drain mode")
 	flags.BoolVar(&disable, "disable", false, "Disable drain mode")
 	flags.StringVar(&deadline, "deadline", "", "Deadline after which allocations are force stopped")
+	flags.BoolVar(&detach, "detach", false, "")
 	flags.BoolVar(&force, "force", false, "Force immediate drain")
 	flags.BoolVar(&noDeadline, "no-deadline", false, "Drain node with no deadline")
 	flags.BoolVar(&ignoreSystem, "ignore-system", false, "Do not drain system job allocations from the node")
@@ -252,11 +257,45 @@ func (c *NodeDrainCommand) Run(args []string) int {
 	}
 
 	// Toggle node draining
-	if _, err := client.Nodes().UpdateDrain(node.ID, spec, nil); err != nil {
+	meta, err := client.Nodes().UpdateDrain(node.ID, spec, nil)
+	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error updating drain specification: %s", err))
 		return 1
 	}
 
 	c.Ui.Output(fmt.Sprintf("Node %q drain strategy set", node.ID))
+
+	if enable && !detach {
+		if err := monitorDrain(client.Nodes(), node.ID, meta.LastIndex); err != nil {
+			c.Ui.Error(fmt.Sprintf("Error monitoring drain: %v", err))
+			return 1
+		}
+
+		c.Ui.Output(fmt.Sprintf("Node %q drain complete", nodeID))
+	}
+
 	return 0
+}
+
+// monitorDrain monitors the node being drained and exits when the node has
+// finished draining.
+func monitorDrain(nodeClient *api.Nodes, nodeID string, index uint64) error {
+	for {
+		q := api.QueryOptions{
+			AllowStale: true,
+			WaitIndex:  index,
+		}
+		node, meta, err := nodeClient.Info(nodeID, &q)
+		if err != nil {
+			return err
+		}
+
+		if node.DrainStrategy != nil {
+			// Drain still ongoing
+			index = meta.LastIndex
+			continue
+		}
+
+		return nil
+	}
 }
