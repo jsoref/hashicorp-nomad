@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/command/agent"
@@ -123,13 +124,21 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	})
 
 	// Register a job to create an alloc to drain
+	count := 3
 	job := &api.Job{
 		ID:          helper.StringToPtr("mock_service"),
 		Name:        helper.StringToPtr("mock_service"),
 		Datacenters: []string{"dc1"},
 		TaskGroups: []*api.TaskGroup{
 			{
-				Name: helper.StringToPtr("mock_group"),
+				Name:  helper.StringToPtr("mock_group"),
+				Count: &count,
+				Migrate: &api.MigrateStrategy{
+					MaxParallel:     helper.IntToPtr(1),
+					HealthCheck:     helper.StringToPtr("task_states"),
+					MinHealthyTime:  helper.TimeToPtr(10 * time.Millisecond),
+					HealthyDeadline: helper.TimeToPtr(5 * time.Minute),
+				},
 				Tasks: []*api.Task{
 					{
 						Name:   "mock_task",
@@ -153,8 +162,13 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 		if err != nil {
 			return false, err
 		}
-		if len(allocs) == 0 {
-			return false, fmt.Errorf("no allocs")
+		if len(allocs) != count {
+			return false, fmt.Errorf("number of allocs %d != count (%d)", len(allocs), count)
+		}
+		for _, a := range allocs {
+			if a.ClientStatus != "running" {
+				return false, fmt.Errorf("alloc %q still not running: %s", a.ID, a.ClientStatus)
+			}
 		}
 		return true, nil
 	}, func(err error) {
@@ -168,8 +182,9 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 	}
 
 	out := ui.OutputWriter.String()
-	expected := "drain complete"
-	require.Contains(out, expected)
+	require.Contains(out, "drain complete")
+
+	t.Log("Output:\n", out)
 
 	node, _, err := client.Nodes().Info(nodeID, nil)
 	require.Nil(err)
@@ -177,8 +192,11 @@ func TestNodeDrainCommand_Monitor(t *testing.T) {
 
 	allocs, _, err := client.Nodes().Allocations(nodeID, nil)
 	require.Nil(err)
-	require.Len(allocs, 1)
-	require.Equal("stop", allocs[0].DesiredStatus)
+	require.Len(allocs, count)
+	for _, a := range allocs {
+		require.Contains(out, fmt.Sprintf("%q draining", a.ID))
+		require.Equal("stop", a.DesiredStatus)
+	}
 }
 
 func TestNodeDrainCommand_Fails(t *testing.T) {

@@ -266,7 +266,7 @@ func (c *NodeDrainCommand) Run(args []string) int {
 	c.Ui.Output(fmt.Sprintf("Node %q drain strategy set", node.ID))
 
 	if enable && !detach {
-		if err := monitorDrain(client.Nodes(), node.ID, meta.LastIndex); err != nil {
+		if err := monitorDrain(c.Ui.Output, client.Nodes(), node.ID, meta.LastIndex); err != nil {
 			c.Ui.Error(fmt.Sprintf("Error monitoring drain: %v", err))
 			return 1
 		}
@@ -279,23 +279,114 @@ func (c *NodeDrainCommand) Run(args []string) int {
 
 // monitorDrain monitors the node being drained and exits when the node has
 // finished draining.
-func monitorDrain(nodeClient *api.Nodes, nodeID string, index uint64) error {
-	for {
-		q := api.QueryOptions{
-			AllowStale: true,
-			WaitIndex:  index,
-		}
-		node, meta, err := nodeClient.Info(nodeID, &q)
-		if err != nil {
-			return err
-		}
+func monitorDrain(output func(string), nodeClient *api.Nodes, nodeID string, index uint64) error {
+	doneCh := make(chan struct{})
+	defer close(doneCh)
 
-		if node.DrainStrategy != nil {
+	// Errors from either goroutine are sent here
+	errCh := make(chan error, 1)
+
+	// Monitor node changes and close chan when drain is complete
+	nodeCh := make(chan struct{})
+	go func() {
+		for {
+			q := api.QueryOptions{
+				AllowStale: true,
+				WaitIndex:  index,
+			}
+			node, meta, err := nodeClient.Info(nodeID, &q)
+			if err != nil {
+				select {
+				case errCh <- err:
+				case <-doneCh:
+				}
+				return
+			}
+
+			if node.DrainStrategy == nil {
+				close(nodeCh)
+				return
+			}
+
 			// Drain still ongoing
 			index = meta.LastIndex
-			continue
+		}
+	}()
+
+	// Monitor alloc changes
+	allocCh := make(chan string, 1)
+	go func() {
+		allocs, meta, err := nodeClient.Allocations(nodeID, nil)
+		if err != nil {
+			select {
+			case errCh <- err:
+			case <-doneCh:
+			}
+			return
 		}
 
-		return nil
+		initial := make(map[string]*api.Allocation, len(allocs))
+		for _, a := range allocs {
+			initial[a.ID] = a
+		}
+
+		for {
+			q := api.QueryOptions{
+				AllowStale: true,
+				WaitIndex:  meta.LastIndex,
+			}
+
+			allocs, meta, err = nodeClient.Allocations(nodeID, &q)
+			if err != nil {
+				select {
+				case errCh <- err:
+				case <-doneCh:
+				}
+				return
+			}
+
+			for _, a := range allocs {
+				// Get previous version of alloc
+				orig, ok := initial[a.ID]
+
+				// Update local alloc state
+				initial[a.ID] = a
+
+				msg := ""
+				switch {
+				case !ok:
+					// Should only be possible if response
+					// from initial Allocations call was
+					// stale. No need to output
+
+				case orig.ClientStatus != a.ClientStatus:
+					// Alloc status has changed; output
+					msg = fmt.Sprintf("status %s -> %s", orig.ClientStatus, a.ClientStatus)
+
+				case !orig.DesiredTransition.ShouldMigrate() && a.DesiredTransition.ShouldMigrate():
+					// Alloc marked for migration
+					msg = "draining"
+				}
+
+				if msg != "" {
+					select {
+					case allocCh <- fmt.Sprintf("Alloc %q %s", a.ID, msg):
+					case <-doneCh:
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case err := <-errCh:
+			return err
+		case <-nodeCh:
+			return nil
+		case msg := <-allocCh:
+			output(msg)
+		}
 	}
 }
